@@ -1,6 +1,8 @@
+var debugLevel = process.env['NODE_DEBUG_AMQP'] ? 1 : 0;
 var events = require('events'),
     util = require('util'),
     net = require('net'),
+		tls = require('tls'),
     protocol,
     jspack = require('./jspack').jspack,
     Buffer = require('buffer').Buffer,
@@ -65,9 +67,65 @@ function mixin () {
 }
 
 
-var debugLevel = process.env['NODE_DEBUG_AMQP'] ? 1 : 0;
+// Helper method to proxy getter's, setters, and functions from one object to another
+function proxyMethod(obj,method){
+	var arguments = Array.prototype.slice.call(arguments,2);
+	return obj[method].apply(obj,arguments);
+}
+function proxyGetter(obj,property){
+	return obj[property];
+}
+function proxySetter(obj,property,value){
+	obj[property] = value;
+}
+function objectProxy(a,b) {
+		//if ('object' !== typeof b) { return;}
+		var bproto = Object.getPrototypeOf(b);
+		for (var i in bproto){
+			
+			if ('undefined' !== typeof a[i]){
+				continue;
+			}
+			var btype = typeof b[i];
+			var g = bproto.__lookupGetter__(i), s = bproto.__lookupSetter__(i);
+      
+			if ( g || s ) {							
+				if ( g ){												
+						a.__defineGetter__(i, proxyGetter.bind(b,b,i));
+				}
+				if ( s ) {							
+						a.__defineSetter__(i, proxySetter.bind(b,b,i));
+				}
+			}	else if ('function' === btype){
+				a[i] = proxyMethod.bind(b,b,i);										
+			}
+		}
+
+    for ( var i in b ) {
+			var btype = typeof b[i];
+			
+			if ('undefined' !== typeof a[i]){
+				continue;
+			}
+			
+			var g = b.__lookupGetter__(i), s = b.__lookupSetter__(i);
+		 
+			if ( g || s ) {							
+				if ( g ){						
+						a.__defineGetter__(i, proxyGetter.bind(b,b,i));
+				}
+				if ( s ) {			
+						a.__defineSetter__(i, proxySetter.bind(b,b,i));
+				}
+			}	else if ('function' === btype){
+				a[i] = proxyMethod.bind(b,b,i);										
+			}
+    }
+    return a;
+}
+
 function debug (x) {
-  if (debugLevel > 0) util.log(x + '\n');
+  if (debugLevel > 0) console.error(x + '\n');
 }
 
 
@@ -81,12 +139,38 @@ var methods = {};
 // classes keyed on their index
 var classes = {};
 
+(function () { // anon scope for init
+  //debug("initializing amqp methods...");
+  protocol = require('./amqp-definitions-0-9-1');
+
+  for (var i = 0; i < protocol.classes.length; i++) {
+    var classInfo = protocol.classes[i];
+    classes[classInfo.index] = classInfo;
+    for (var j = 0; j < classInfo.methods.length; j++) {
+      var methodInfo = classInfo.methods[j];
+      
+      var name = classInfo.name
+        + methodInfo.name[0].toUpperCase()
+        + methodInfo.name.slice(1);
+      //debug(name);
+      
+      var method = { name: name
+                     , fields: methodInfo.fields
+                     , methodIndex: methodInfo.index
+                     , classIndex: classInfo.index
+                   };
+      
+      if (!methodTable[classInfo.index]) methodTable[classInfo.index] = {};
+      methodTable[classInfo.index][methodInfo.index] = method;
+      methods[name] = method;
+    }
+  }
+})(); // end anon scope
 
 // parser
 
-
-var maxFrameBuffer = 131072; // same as rabbitmq
-
+var maxFrameBuffer = 131072; // 128k, same as rabbitmq (which was
+                             // copying qpid)
 
 // An interruptible AMQP parser.
 //
@@ -108,36 +192,86 @@ function AMQPParser (version, type) {
 
   if (version != '0-9-1') this.throwError("Unsupported protocol version");
 
-  protocol = require('./amqp-definitions-'+version);
+  var frameHeader = new Buffer(7);
+  frameHeader.used = 0;
+  var frameBuffer, frameType, frameChannel;
 
-(function () { // anon scope for init
-  //debug("initializing amqp methods...");
-  for (var i = 0; i < protocol.classes.length; i++) {
-    var classInfo = protocol.classes[i];
-    classes[classInfo.index] = classInfo;
-    for (var j = 0; j < classInfo.methods.length; j++) {
-      var methodInfo = classInfo.methods[j];
+  var self = this;
 
-      var name = classInfo.name
-               + methodInfo.name[0].toUpperCase()
-               + methodInfo.name.slice(1);
-      //debug(name);
-
-      var method = { name: name
-                   , fields: methodInfo.fields
-                   , methodIndex: methodInfo.index
-                   , classIndex: classInfo.index
-                   };
-
-      if (!methodTable[classInfo.index]) methodTable[classInfo.index] = {};
-      methodTable[classInfo.index][methodInfo.index] = method;
-      methods[name] = method;
+  function header(data) {
+    var fh = frameHeader;
+    var needed = fh.length - fh.used;
+    data.copy(fh, fh.used, 0, data.length);
+    fh.used += data.length; // sloppy
+    if (fh.used >= fh.length) {
+      fh.read = 0;
+      frameType = fh[fh.read++];
+      frameChannel = parseInt(fh, 2);
+      var frameSize = parseInt(fh, 4);
+      fh.used = 0; // for reuse
+      if (frameSize > maxFrameBuffer) {
+        self.throwError("Oversized frame " + frameSize);
+      }
+      frameBuffer = new Buffer(frameSize);
+      frameBuffer.used = 0;
+      return frame(data.slice(needed));
+    }
+    else { // need more!
+      return header;
     }
   }
-})(); // end anon scope
 
-  this.frameHeader = new Buffer(7);
-  this.frameHeader.used = 0;
+  function frame(data) {
+    var fb = frameBuffer;
+    var needed = fb.length - fb.used;
+    data.copy(fb, fb.used, 0, data.length);
+    fb.used += data.length;
+    if (data.length > needed) {
+      return frameEnd(data.slice(needed));
+    }
+    else if (data.length == needed) {
+      return frameEnd;
+    }
+    else {
+      return frame;
+    }
+  }
+
+  function frameEnd(data) {
+    if (data.length > 0) {
+      if (data[0] === 206) {
+        switch (frameType) {
+        case 1:
+          self._parseMethodFrame(frameChannel, frameBuffer);
+          break;
+        case 2:
+          self._parseHeaderFrame(frameChannel, frameBuffer);
+          break;
+        case 3:
+          if (self.onContent) {
+            self.onContent(frameChannel, frameBuffer);
+          }
+          break;
+        case 8:
+          debug("hearbeat");
+          if (self.onHeartBeat) self.onHeartBeat();
+          break;
+        default:
+          self.throwError("Unhandled frame type " + frameType);
+          break;
+        }
+        return header(data.slice(1));
+      }
+      else {
+        self.throwError("Missing frame end marker");
+      }
+    }
+    else {
+      return frameEnd;
+    }
+  }
+
+  self.parse = header;
 }
 
 // If there's an error in the parser, call the onError handler or throw
@@ -150,98 +284,9 @@ AMQPParser.prototype.throwError = function (error) {
 // parsing.
 AMQPParser.prototype.execute = function (data) {
   // This function only deals with dismantling and buffering the frames.
-  // It delegats to other functions for parsing the frame-body.
+  // It delegates to other functions for parsing the frame-body.
   debug('execute: ' + data.toString());
-  for (var i = 0; i < data.length; i++) {
-    switch (this.state) {
-      case 'frameHeader':
-        // Here we buffer the frame header. Remember, this is a fully
-        // interruptible parser - it could be (although unlikely)
-        // that we receive only several octets of the frame header
-        // in one packet.
-        this.frameHeader[this.frameHeader.used++] = data[i];
-
-        if (this.frameHeader.used == this.frameHeader.length) {
-          // Finished buffering the frame header - parse it
-          //var h = this.frameHeader.unpack("oonN", 0);
-
-          this.frameHeader.read = 0;
-          this.frameType = this.frameHeader[this.frameHeader.read++];
-          this.frameChannel = parseInt(this.frameHeader, 2);
-          this.frameSize = parseInt(this.frameHeader, 4);
-
-          this.frameHeader.used = 0; // for reuse
-
-          debug("got frame: " + JSON.stringify([ this.frameType
-                                               , this.frameChannel
-                                               , this.frameSize
-                                               ]));
-
-          if (this.frameSize > maxFrameBuffer) {
-            this.throwError("Oversized frame " + this.frameSize);
-          }
-
-          // TODO use a free list and keep a bunch of 8k buffers around
-          this.frameBuffer = new Buffer(this.frameSize);
-          this.frameBuffer.used = 0;
-          this.state = 'bufferFrame';
-        }
-        break;
-
-      case 'bufferFrame':
-        // Buffer the entire frame. I would love to avoid this, but doing
-        // otherwise seems to be extremely painful.
-
-        // Copy the incoming data byte-by-byte to the buffer.
-        // FIXME This is slow! Can be improved with a memcpy binding.
-        if(this.frameSize > 0)
-          this.frameBuffer[this.frameBuffer.used++] = data[i];
-        else
-          i--; // the frame ending is actuall this frame (rewind 1)
-
-        if (this.frameBuffer.used == this.frameSize) {
-          // Finished buffering the frame. Parse the frame.
-          switch (this.frameType) {
-            case 1:
-              this._parseMethodFrame(this.frameChannel, this.frameBuffer);
-              break;
-
-            case 2:
-              this._parseHeaderFrame(this.frameChannel, this.frameBuffer);
-              break;
-
-            case 3:
-              if (this.onContent) {
-                this.onContent(this.frameChannel, this.frameBuffer);
-              }
-              break;
-
-            case 8:
-              debug("hearbeat");
-              if (this.onHeartBeat) this.onHeartBeat();
-              break;
-
-            default:
-              this.throwError("Unhandled frame type " + this.frameType);
-              break;
-          }
-          this.state = 'frameEnd';
-        }
-        break;
-
-      case 'frameEnd':
-        // Frames are terminated by a single octet.
-        if (data[i] != 206 /* constants.frameEnd */) {
-          debug('data[' + i + '] = ' + data[i].toString(16));
-          debug('data = ' + data.toString());
-          debug('frameHeader: ' + this.frameHeader.toString());
-          debug('frameBuffer: ' + this.frameBuffer.toString());
-          this.throwError("Oversized frame");
-        }
-        this.state = 'frameHeader';
-        break;
-    }
-  }
+  this.parse = this.parse(data);
 };
 
 
@@ -439,7 +484,6 @@ AMQPParser.prototype._parseMethodFrame = function (channel, buffer) {
   var classId = parseInt(buffer, 2),
      methodId = parseInt(buffer, 2);
 
-
   // Make sure that this is a method that we understand.
   if (!methodTable[classId] || !methodTable[classId][methodId]) {
     this.throwError("Received unknown [classId, methodId] pair [" +
@@ -465,14 +509,11 @@ AMQPParser.prototype._parseHeaderFrame = function (channel, buffer) {
   var weight = parseInt(buffer, 2);
   var size = parseInt(buffer, 8);
 
-
-
   var classInfo = classes[classIndex];
 
   if (classInfo.fields.length > 15) {
     this.throwError("TODO: support more than 15 properties");
   }
-
 
   var propertyFlags = parseInt(buffer, 2);
 
@@ -783,23 +824,71 @@ function serializeFields (buffer, fields, args, strict) {
 }
 
 
+function Connection (connectionArgs, options, sslOptions) {
 
-
-function Connection (connectionArgs, options) {
-  net.Stream.call(this);
-
-  var self = this;
-
+	var self = this;	
   this.setOptions(connectionArgs);
   this.setImplOptions(options);
-
+	this.sslOptions = sslOptions;
+	if (this.options.url){
+		this.options = urlOptions(this.options.url);		
+	}
+	debug(util.inspect(this.options));
   var state = 'handshake';
   var parser;
 
   this._defaultExchange = null;
   this.channelCounter = 0;
+  this._sendBuffer = new Buffer(maxFrameBuffer);
+	this.reconnect();
+}
 
-  self.addListener('connect', function () {
+//util.inherits(Connection, events.EventEmitter);
+exports.Connection = Connection;
+
+
+var defaultPorts = { 'amqp': 5672, 'amqps': 5671 };
+
+var defaultOptions = { host: 'localhost'
+                     , port: defaultPorts['amqp']
+                     , login: 'guest'
+                     , password: 'guest'
+                     , vhost: '/'
+                     };
+var defaultImplOptions = { defaultExchangeName: '' };
+
+function urlOptions(connectionString) {
+  var opts = {};
+  var url = URL.parse(connectionString);
+  var scheme = url.protocol.substring(0, url.protocol.lastIndexOf(':'));
+  if (scheme != 'amqp' && scheme != 'amqps') {
+    throw new Error('Connection URI must use amqp or amqps scheme. ' +
+                    'For example, "amqp://bus.megacorp.internal:5766".');
+  }
+  opts.ssl = ('amqps' === scheme);
+  opts.host = url.hostname;
+  opts.port = url.port || defaultPorts[scheme]
+  if (url.auth) {
+    var auth = url.auth.split(':');
+    auth[0] && (opts.login = auth[0]);
+    auth[1] && (opts.password = auth[1]);
+  }
+  if (url.pathname) {
+    opts.vhost = unescape(url.pathname.substr(1));
+  }
+  return opts;
+}
+
+exports.createConnection = function (connectionArgs, options, sslConfig) {
+  var c = new Connection(connectionArgs, options, sslConfig);  
+  return c;
+};
+
+Connection.prototype.initConnection = function(conn){
+	var self = this;
+	var connectEvent = this.options.ssl ? 'secureConnect': 'connect';
+	debug('initConnection with '+connectEvent);
+	self.addListener(connectEvent, function () {		
     // channel 0 is the control channel.
     self.channels = {0:self};
     self.queues = {};
@@ -844,7 +933,7 @@ function Connection (connectionArgs, options) {
     // Time to start the AMQP 7-way connection initialization handshake!
     // 1. The client sends the server a version string
     self.write("AMQP" + String.fromCharCode(0,0,9,1));
-    state = 'handshake';
+    state = 'handshake';				
   });
 
   self.addListener('data', function (data) {
@@ -856,51 +945,9 @@ function Connection (connectionArgs, options) {
     // in order to allow reconnects, have to clear the
     // state.
     parser = null;
-  });
-}
-util.inherits(Connection, net.Stream);
-exports.Connection = Connection;
-
-
-var defaultPorts = { 'amqp': 5672, 'amqps': 5671 };
-
-var defaultOptions = { host: 'localhost'
-                     , port: defaultPorts['amqp']
-                     , login: 'guest'
-                     , password: 'guest'
-                     , vhost: '/'
-                     };
-var defaultImplOptions = { defaultExchangeName: '' };
-
-function urlOptions(connectionString) {
-  var opts = {};
-  var url = URL.parse(connectionString);
-  var scheme = url.protocol.substring(0, url.protocol.lastIndexOf(':'));
-  if (scheme != 'amqp' && scheme != 'amqps') {
-    throw new Error('Connection URI must use amqp or amqps scheme. ' +
-                    'For example, "amqp://bus.megacorp.internal:5766".');
-  }
-  opts.ssl = ('amqps' === scheme);
-  opts.host = url.hostname;
-  opts.port = url.port || defaultPorts[scheme]
-  if (url.auth) {
-    var auth = url.auth.split(':');
-    auth[0] && (opts.login = auth[0]);
-    auth[1] && (opts.password = auth[1]);
-  }
-  if (url.pathname) {
-    opts.vhost = unescape(url.pathname.substr(1));
-  }
-  return opts;
+  });	
 }
 
-exports.createConnection = function (connectionArgs, options) {
-  var c = new Connection();
-  c.setOptions(connectionArgs);
-  c.setImplOptions(options);
-  c.reconnect();
-  return c;
-};
 
 Connection.prototype.setOptions = function (options) {
   var o  = {};
@@ -916,7 +963,21 @@ Connection.prototype.setImplOptions = function(options) {
 }
 
 Connection.prototype.reconnect = function () {
-  this.connect(this.options.port, this.options.host);
+  this.conn = this.connect(this.options.port, this.options.host, this.sslOptions);
+	//copy connection methods and properties to "this" to keep backwards compatibility
+	objectProxy(this,this.conn);
+	this.initConnection(this.conn);
+};
+
+Connection.prototype.connect = function (port,host,options) {
+  if (this.options.ssl) {
+		debug('making ssl connection');
+		this.conn = tls.connect(port,host,options);
+	} else {
+		debug('making non-ssl connection');
+		this.conn = net.connect(port,host);
+	}
+	return this.conn;
 };
 
 Connection.prototype._onMethod = function (channel, method, args) {
@@ -987,15 +1048,15 @@ Connection.prototype._onMethod = function (channel, method, args) {
 
     case methods.connectionOpenOk:
       // 7. Finally they respond with connectionOpenOk
-      // Whew! That's why they call it the Advanced MQP.
-      this.emit('ready');
+      // Whew! That's why they call it the Advanced MQP.			
+      this.conn.emit('ready');
       break;
 
     case methods.connectionClose:
       var e = new Error(args.replyText);
       e.code = args.replyCode;
       if (!this.listeners('close').length) {
-        util.debug('Unhandled connection error: ' + args.replyText);
+        console.log('Unhandled connection error: ' + args.replyText);
       }
       this.destroy(e);
       break;
@@ -1007,12 +1068,12 @@ Connection.prototype._onMethod = function (channel, method, args) {
 };
 
 Connection.prototype.heartbeat = function() {
-  this.write(new Buffer([8,0,0,0,0,0,0,206]));
+  this.conn.write(new Buffer([8,0,0,0,0,0,0,206]));
 };
 
 Connection.prototype._sendMethod = function (channel, method, args) {
   debug(channel + " < " + method.name + " " + JSON.stringify(args));
-  var b = new Buffer(maxFrameBuffer);
+  var b = this._sendBuffer;
   b.used = 0;
 
   b[b.used++] = 1; // constants.frameMethod
@@ -1454,6 +1515,7 @@ Queue.prototype.subscribe = function (/* options, messageListener */) {
   if(typeof(messageListener) !== "function") messageListener = null;
 
   var options = { ack: false,
+                  prefetchCount: 1,
                   routingKeyInPayload: self.connection.options.routingKeyInPayload,
                   deliveryTagInPayload: self.connection.options.deliveryTagInPayload };
   if (typeof arguments[0] == 'object') {
@@ -1462,13 +1524,16 @@ Queue.prototype.subscribe = function (/* options, messageListener */) {
       options.routingKeyInPayload = arguments[0].routingKeyInPayload;
     if (arguments[0].deliveryTagInPayload)
       options.deliveryTagInPayload = arguments[0].deliveryTagInPayload;
+    if (arguments[0].prefetchCount != undefined)
+      options.prefetchCount = arguments[0].prefetchCount;
+
   }
 
   if (options.ack) {
     self.connection._sendMethod(self.channel, methods.basicQos,
         { reserved1: 0
         , prefetchSize: 0
-        , prefetchCount: 1
+        , prefetchCount: options.prefetchCount
         , global: false
         });
   }
@@ -1534,8 +1599,8 @@ Queue.prototype.subscribe = function (/* options, messageListener */) {
             headers[i] = this.headers[i];
         }
       }
-      if (messageListener) messageListener(json, headers, deliveryInfo);
-      self.emit('message', json, headers, deliveryInfo);
+      if (messageListener) messageListener(json, headers, deliveryInfo, m);
+      self.emit('message', json, headers, deliveryInfo, m);
     });
   });
 };
