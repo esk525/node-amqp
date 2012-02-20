@@ -9,6 +9,7 @@ var events = require('events'),
     Promise = require('./promise').Promise,
     URL = require('url');
 
+		
 function mixin () {
   // copy reference to target object
   var target = arguments[0] || {}, i = 1, length = arguments.length, deep = false, source;
@@ -125,7 +126,12 @@ function objectProxy(a,b) {
 }
 
 function debug (x) {
-  if (debugLevel > 0) console.error(x + '\n');
+  if (debugLevel > 0) {
+		console.error(x + '\n');
+		if (global.common) {
+			common.log(x);
+		}
+	}
 }
 
 
@@ -725,7 +731,7 @@ function serializeTable (b, object) {
           b[b.used++] = 'F'.charCodeAt(0);
           serializeTable(b, value);
         } else {
-          this.throwError("unsupported type in amqp table: " + typeof(value));
+          throw new Error("unsupported type in amqp table: " + typeof(value));
         }
       }
     }
@@ -879,7 +885,8 @@ function urlOptions(connectionString) {
   return opts;
 }
 
-exports.createConnection = function (connectionArgs, options, sslConfig) {
+exports.createConnection = function (connectionArgs, options, sslConfig) {	
+	console.log(' in createConnection');
   var c = new Connection(connectionArgs, options, sslConfig);  
   return c;
 };
