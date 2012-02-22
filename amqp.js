@@ -901,13 +901,13 @@ Connection.prototype.initConnection = function(conn){
     self.queues = {};
     self.exchanges = {};
 
-    parser = new AMQPParser('0-9-1', 'client');
+    self.parser = new AMQPParser('0-9-1', 'client');
 
-    parser.onMethod = function (channel, method, args) {
+    self.parser.onMethod = function (channel, method, args) {
       self._onMethod(channel, method, args);
     };
 
-    parser.onContent = function (channel, data) {
+    self.parser.onContent = function (channel, data) {
       debug(channel + " > content " + data.length);
       if (self.channels[channel] && self.channels[channel]._onContent) {
         self.channels[channel]._onContent(channel, data);
@@ -916,7 +916,7 @@ Connection.prototype.initConnection = function(conn){
       }
     };
 
-    parser.onContentHeader = function (channel, classInfo, weight, properties, size) {
+    self.parser.onContentHeader = function (channel, classInfo, weight, properties, size) {
       debug(channel + " > content header " + JSON.stringify([classInfo.name, weight, properties, size]));
       if (self.channels[channel] && self.channels[channel]._onContentHeader) {
         self.channels[channel]._onContentHeader(channel, classInfo, weight, properties, size);
@@ -925,33 +925,35 @@ Connection.prototype.initConnection = function(conn){
       }
     };
 
-    parser.onHeartBeat = function () {
+    self.parser.onHeartBeat = function () {
       self.emit("heartbeat");
       debug("heartbeat");
     };
 
-    parser.onError = function(e) {
+    self.parser.onError = function(e) {
       self.end();
       self.emit("error", e);
       self.emit("close");
-      parser = null;
+      self.parser = null;
     };
     //debug("connected...");
     // Time to start the AMQP 7-way connection initialization handshake!
     // 1. The client sends the server a version string
-    self.write("AMQP" + String.fromCharCode(0,0,9,1));
-    state = 'handshake';				
+    
+		this.write("AMQP" + String.fromCharCode(0,0,9,1));
+		state = 'handshake';				
+						
   });
 
   self.addListener('data', function (data) {
-    parser.execute(data);
+    self.parser.execute(data);
   });
 
   self.addListener('end', function () {
     self.end();
     // in order to allow reconnects, have to clear the
     // state.
-    parser = null;
+    self.parser = null;
   });	
 }
 
