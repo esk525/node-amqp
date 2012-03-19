@@ -502,7 +502,7 @@ AMQPParser.prototype._parseMethodFrame = function (channel, buffer) {
 
   var args = parseFields(buffer, method.fields);
 
-  if (this.onMethod) {
+  if (this.onMethod) {	
     this.onMethod(channel, method, args);
   }
 };
@@ -946,7 +946,9 @@ Connection.prototype.initConnection = function(conn){
   });
 
   self.addListener('data', function (data) {
-    self.parser.execute(data);
+		if (self.parser) {
+			self.parser.execute(data);
+		}
   });
 
   self.addListener('end', function () {
@@ -994,8 +996,7 @@ Connection.prototype._onMethod = function (channel, method, args) {
 
   // Channel 0 is the control channel. If not zero then deligate to
   // one of the channel objects.
-
-  if (channel > 0) {
+	if (channel > 0) {
     if (!this.channels[channel]) {
       debug("Received message on untracked channel.");
       return;
@@ -1769,7 +1770,7 @@ Queue.prototype._onMethod = function (channel, method, args) {
       this.name = args.queue;
       this.connection.queues[this.name] = this;
       if (this._openCallback) {
-        this._openCallback(this);
+        this._openCallback(this); 
         this._openCallback = null;
       }
       // TODO this is legacy interface, remove me
